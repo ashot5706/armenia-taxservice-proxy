@@ -1,0 +1,8 @@
+certs/*
+!certs/ca_645b34a4865e7.crt
+
+receipts/*
+!receipts/.gitkeep
+
+.env
+node_modules/
