@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "description": "Simple Node.js proxy/client for Armenian Tax Service ECRM receipt operations",
   "main": "app.js",
+  "license": "MIT",
   "scripts": {
     "start": "node app.js",
     "dev": "NODE_ENV=development node app.js"
