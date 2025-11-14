@@ -206,6 +206,11 @@ app.post('/print', async (req, res) => {
     headers: language ? { 'language': language } : {}
   }).then(response => response.data);
 
+  storeReceipt(data.result).catch(err => {
+    console.error('Failed to store receipt:', err);
+    console.log('Receipt data:', JSON.stringify(data, null, 2));
+  });
+
   res.json(data);
 });
 
@@ -250,6 +255,11 @@ app.post('/printReturnReceipt', async (req, res) => {
   const data = await taxAxios.post('/api/v1.0/printReturnReceipt', body, {
     headers: language ? { 'language': language } : {}
   }).then(response => response.data);
+
+  storeReceipt(data.result, body.receiptId).catch(err => {
+    console.error('Failed to store return receipt:', err);
+    console.log('Return receipt data:', JSON.stringify(data, null, 2));
+  });
 
   res.json(data);
 });
