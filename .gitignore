@@ -4,5 +4,8 @@ certs/*
 receipts/*
 !receipts/.gitkeep
 
+idempotency/*
+!idempotency/.gitkeep
+
 .env
 node_modules/

@@ -56,6 +56,7 @@ TIN=your_tin_here
 
 # Optional security and integrations
 AUTH_TOKEN=some-secret-token         # optional: restrict access to this proxy
+PRINT_IDEMPOTENCY_DIR=./idempotency  # durable print request/result markers
 TELEGRAM_BOT_TOKEN=123:ABC            # optional: send notifications
 TELEGRAM_CHANNEL_ID=@your_channel     # optional: channel id to post receipts
 
@@ -92,10 +93,10 @@ The proxy supports the following endpoints (all `POST` unless noted):
 - `POST /activate` — forwards to `/api/v1.0/activate`
 - `POST /configureDepartments` — forwards to `/api/v1.0/configureDepartments`
 - `POST /getGoodList` — forwards to `/api/v1.0/getGoodList` (adds `tin` and default `taxRegime`)
-- `POST /print` — forwards to `/api/v1.0/print`
+- `POST /print` — forwards to `/api/v1.0/print`; requires an `Idempotency-Key` header
 - `POST /printCopy` — forwards to `/api/v1.0/printCopy` (requires `receiptId`)
 - `POST /getReturnedReceiptInfo` — forwards to `/api/v1.0/getReturnedReceiptInfo` (requires `receiptId`)
-- `POST /printReturnReceipt` — forwards to `/api/v1.0/printReturnReceipt` (requires `receiptId`)
+- `POST /printReturnReceipt` — forwards to `/api/v1.0/printReturnReceipt`; requires `receiptId` and an `Idempotency-Key` header
 - `GET /healthz` — basic health-check
 
 All routes pass through the mTLS client certificate and will include `crn` and `seq` automatically.
@@ -118,6 +119,9 @@ Replace `http://localhost:3000` with `https://your-host` if you deploy behind TL
 ## Receipts and notifications
 
 - Successful responses that include receipt payloads are stored under `./receipts/` as `receipt_<receiptId>_<timestamp>.json`.
+- `/print` and `/printReturnReceipt` store durable request outcomes under `PRINT_IDEMPOTENCY_DIR`. Repeating a completed key replays the original response without printing or returning a receipt again.
+- A pending key after any Tax Service error, timeout, or process interruption is treated as an unknown fiscal outcome and returns HTTP 409 instead of risking a duplicate receipt. An operator must reconcile it against the stored receipt/Tax Service before changing that marker.
+- `PRINT_IDEMPOTENCY_DIR` must be a persistent filesystem shared by every proxy process serving the same fiscal register. Marker files and directory entries are synced before a print response is acknowledged.
 - If `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHANNEL_ID` are set, receipts are posted to the configured Telegram channel.
 
 ## Error handling

@@ -15,6 +15,8 @@ const express = require('express');
 const bodyParser = require('body-parser');
 const axios = require('axios');
 const { HttpBadRequestError, HttpError, HttpUnauthorizedError } = require('./errors/HttpErrors');
+const { PrintIdempotencyStore } = require('./print-idempotency');
+const { asyncRoute } = require('./async-route');
 
 const TAX_REGIMES = {
   VAT_TAXABLE: 1,
@@ -36,15 +38,19 @@ const TIN = process.env.TIN;
 const AUTH_TOKEN = process.env.AUTH_TOKEN; // Optional auth token to restrict access to this proxy
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN; // Optional Telegram bot token for notifications
 const TELEGRAM_CHANNEL_ID = process.env.TELEGRAM_CHANNEL_ID; // Optional Telegram channel ID for notifications
+const PRINT_IDEMPOTENCY_DIR = process.env.PRINT_IDEMPOTENCY_DIR || './idempotency';
+const printIdempotency = new PrintIdempotencyStore(PRINT_IDEMPOTENCY_DIR);
 
 if (!CRN) {
   throw new Error('CRN environment variable is required');
 }
 
-async function storeReceipt(receipt, returnReceiptId = null) {
+function persistReceipt(receipt) {
   const id = receipt.receiptId;
   fs.writeFileSync(`./receipts/receipt_${id}_${Date.now()}.json`, JSON.stringify(receipt, null, 2));
+}
 
+async function notifyReceipt(receipt, returnReceiptId = null) {
   const message = returnReceiptId ? `New return receipt stored for receiptId: ${returnReceiptId}` : `New receipt stored:`;
   if (TELEGRAM_BOT_TOKEN && TELEGRAM_CHANNEL_ID) {
     await axios.post(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
@@ -53,6 +59,11 @@ async function storeReceipt(receipt, returnReceiptId = null) {
       parse_mode: 'Markdown'
     });
   }
+}
+
+async function storeReceipt(receipt, returnReceiptId = null) {
+  persistReceipt(receipt);
+  await notifyReceipt(receipt, returnReceiptId);
 }
 
 // Build HTTPS agent (mutual TLS)
@@ -152,7 +163,7 @@ app.get('/', (_, res) => {
   });
 });
 
-app.post('/checkConnection', async (req, res) => {
+app.post('/checkConnection', asyncRoute(async (req, res) => {
   const language = req.header('language');
 
   const data = await taxAxios.post('/api/v1.0/checkConnection', {}, {
@@ -160,9 +171,9 @@ app.post('/checkConnection', async (req, res) => {
   }).then(response => response.data);
 
   res.json(data);
-});
+}));
 
-app.post('/activate', async (req, res) => {
+app.post('/activate', asyncRoute(async (req, res) => {
   const language = req.header('language');
   
   const data = await taxAxios.post('/api/v1.0/activate', {}, {
@@ -170,9 +181,9 @@ app.post('/activate', async (req, res) => {
   }).then(response => response.data);
 
   res.json(data);
-});
+}));
 
-app.post('/configureDepartments', async (req, res) => {
+app.post('/configureDepartments', asyncRoute(async (req, res) => {
   const language = req.header('language');
   const body = req.body;
 
@@ -181,9 +192,9 @@ app.post('/configureDepartments', async (req, res) => {
   }).then(response => response.data);
 
   res.json(data);
-});
+}));
 
-app.post('/getGoodList', async (req, res) => {
+app.post('/getGoodList', asyncRoute(async (req, res) => {
   const language = req.header('language');
   const body = {
     tin: TIN,
@@ -196,25 +207,71 @@ app.post('/getGoodList', async (req, res) => {
   }).then(response => response.data);
 
   res.json(data);
-});
+}));
 
-app.post('/print', async (req, res) => {
+app.post('/print', asyncRoute(async (req, res) => {
   const language = req.header('language');
   const body = req.body;
+  const idempotencyKey = (req.header('Idempotency-Key') || '').trim();
 
-  const data = await taxAxios.post('/api/v1.0/print', body, {
-    headers: language ? { 'language': language } : {}
-  }).then(response => response.data);
+  if (!idempotencyKey) {
+    throw new HttpBadRequestError('Missing required Idempotency-Key header');
+  }
+  if (idempotencyKey.length > 200) {
+    throw new HttpBadRequestError('Idempotency-Key is too long');
+  }
 
-  storeReceipt(data.result).catch(err => {
-    console.error('Failed to store receipt:', err);
-    console.log('Receipt data:', JSON.stringify(data, null, 2));
+  const attempt = printIdempotency.begin(idempotencyKey, body);
+  if (attempt.kind === 'replay') {
+    res.set('Idempotency-Replayed', 'true');
+    res.json(attempt.response);
+    return;
+  }
+  if (attempt.kind === 'conflict') {
+    res.status(409).json({
+      code: 409,
+      message: 'IDEMPOTENCY_KEY_CONFLICT',
+      errorMessage: 'The Idempotency-Key was already used with a different print payload',
+      result: null,
+    });
+    return;
+  }
+  if (attempt.kind === 'uncertain') {
+    res.status(409).json({
+      code: 409,
+      message: 'FISCAL_PRINT_OUTCOME_UNKNOWN',
+      errorMessage: 'The previous fiscal print outcome is uncertain; automatic retry is blocked',
+      result: null,
+    });
+    return;
+  }
+
+  let data;
+  try {
+    data = await taxAxios.post('/api/v1.0/print', body, {
+      headers: language ? { 'language': language } : {}
+    }).then(response => response.data);
+  } catch (error) {
+    // No Tax Service error class is documented as conclusively proving that a
+    // receipt was not created. Keep the marker pending/uncertain so neither an
+    // HTTP 4xx/5xx nor a network timeout can automatically reprint.
+    throw error;
+  }
+
+  // Persist the fiscal response and idempotency result before acknowledging it
+  // to bloomina.am. If this process dies after Tax Service prints but before
+  // completion, the pending marker blocks a potentially duplicate retry.
+  persistReceipt(data.result);
+  printIdempotency.complete(idempotencyKey, attempt.requestHash, data);
+
+  notifyReceipt(data.result).catch(err => {
+    console.error('Failed to notify about stored receipt:', err);
   });
 
   res.json(data);
-});
+}));
 
-app.post('/printCopy', async (req, res) => {
+app.post('/printCopy', asyncRoute(async (req, res) => {
   const language = req.header('language');
   const body = req.body;
 
@@ -227,9 +284,9 @@ app.post('/printCopy', async (req, res) => {
   }).then(response => response.data);
 
   res.json(data);
-});
+}));
 
-app.post('/getReturnedReceiptInfo', async (req, res) => {
+app.post('/getReturnedReceiptInfo', asyncRoute(async (req, res) => {
   const language = req.header('language');
   const body = req.body;
 
@@ -242,27 +299,60 @@ app.post('/getReturnedReceiptInfo', async (req, res) => {
   }).then(response => response.data);
 
   res.json(data);
-});
+}));
 
-app.post('/printReturnReceipt', async (req, res) => {
+app.post('/printReturnReceipt', asyncRoute(async (req, res) => {
   const language = req.header('language');
   const body = req.body;
+  const idempotencyKey = (req.header('Idempotency-Key') || '').trim();
 
   if (!body.receiptId) {
-    throw new HttpBadRequestError('Missing required field: receiptId'); 
+    throw new HttpBadRequestError('Missing required field: receiptId');
+  }
+  if (!idempotencyKey) {
+    throw new HttpBadRequestError('Missing required Idempotency-Key header');
+  }
+  if (idempotencyKey.length > 200) {
+    throw new HttpBadRequestError('Idempotency-Key is too long');
+  }
+
+  const attempt = printIdempotency.begin(idempotencyKey, body);
+  if (attempt.kind === 'replay') {
+    res.set('Idempotency-Replayed', 'true');
+    res.json(attempt.response);
+    return;
+  }
+  if (attempt.kind === 'conflict') {
+    res.status(409).json({
+      code: 409,
+      message: 'IDEMPOTENCY_KEY_CONFLICT',
+      errorMessage: 'The Idempotency-Key was already used with a different return payload',
+      result: null,
+    });
+    return;
+  }
+  if (attempt.kind === 'uncertain') {
+    res.status(409).json({
+      code: 409,
+      message: 'FISCAL_RETURN_OUTCOME_UNKNOWN',
+      errorMessage: 'The previous fiscal return outcome is uncertain; automatic retry is blocked',
+      result: null,
+    });
+    return;
   }
 
   const data = await taxAxios.post('/api/v1.0/printReturnReceipt', body, {
     headers: language ? { 'language': language } : {}
   }).then(response => response.data);
 
-  storeReceipt(data.result, body.receiptId).catch(err => {
-    console.error('Failed to store return receipt:', err);
-    console.log('Return receipt data:', JSON.stringify(data, null, 2));
+  persistReceipt(data.result);
+  printIdempotency.complete(idempotencyKey, attempt.requestHash, data);
+  notifyReceipt(data.result, body.receiptId).catch(err => {
+    console.error('Failed to notify about stored return receipt:', err);
   });
 
   res.json(data);
-});
+}));
 
 // Health-check
 app.get('/healthz', (req, res) => {
